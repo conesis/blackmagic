@@ -1,1 +1,17 @@
 See https://github.com/blacksphere/blackmagic/wiki/Hacking
+
+File: readme.txt
+Date: 11/07/2017
+Desc: blackmagic.bin compile for stlink and meant to be loaded on a Blue Pill
+      contains changes up to: commit 568655063faecd24dbaf7359d582fdd9020b2d4b
+
+$ git clone --recursive https://github.com/blacksphere/blackmagic.git
+$ cd blackmagic
+$ cd libopencm3/
+$ make
+$ cd ../src/
+$ vi platforms/stlink/Makefile.inc 
+$ make PROBE_HOST=stlink
+$ stm32flash -w blackmagic.bin -S 0x08000000 -v /dev/ttyUSB0 
+$ git log | head
+

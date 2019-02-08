@@ -37,9 +37,13 @@
 #include "target_internal.h"
 #include "cortexm.h"
 
-static int samd_flash_erase(struct target_flash *t, target_addr addr, size_t len);
-static int samd_flash_write(struct target_flash *f,
-                            target_addr dest, const void *src, size_t len);
+#define UNUSED(v)									(void)(v)
+
+static int samd_flash_erase(struct target_flash*,target_addr,size_t);
+static int samd_flash_write(struct target_flash*,target_addr,const void*,size_t);
+
+static int samd5_flash_erase(struct target_flash*,target_addr,size_t);
+static int samd5_flash_write(struct target_flash*,target_addr,const void*,size_t);
 
 static bool samd_cmd_erase_all(target *t);
 static bool samd_cmd_lock_flash(target *t);
@@ -60,86 +64,136 @@ const struct command_s samd_cmd_list[] = {
 	{NULL, NULL, NULL}
 };
 
+static bool samd5_cmd_lock_flash(target *t);
+static bool samd5_cmd_unlock_flash(target *t);
+static bool samd5_cmd_serial(target *t);
+
+const struct command_s samd5_cmd_list[] = {
+	{"erase_mass", (cmd_handler)samd_cmd_erase_all, "Erase entire flash memory"},
+	{"lock_flash", (cmd_handler)samd5_cmd_lock_flash, "Locks flash against spurious commands"},
+	{"unlock_flash", (cmd_handler)samd5_cmd_unlock_flash, "Unlocks flash"},
+	{"user_row", (cmd_handler)samd_cmd_read_userrow, "Prints user row from flash"},
+	{"serial", (cmd_handler)samd5_cmd_serial, "Prints serial number"},
+	{"mbist", (cmd_handler)samd_cmd_mbist, "Runs the built-in memory test"},
+	{"set_security_bit", (cmd_handler)samd_cmd_ssb, "Sets the Security Bit"},
+	{NULL, NULL, NULL}
+};
+
 /* Non-Volatile Memory Controller (NVMC) Parameters */
-#define SAMD_ROW_SIZE			256
-#define SAMD_PAGE_SIZE			64
+#define SAMD_ROW_SIZE				256
+#define SAMD_PAGE_SIZE				64
+
+#define SAMD5_FLASH_BLOCK_SIZE	8192	// smalest erasable chunk of flash
+#define SAMD5_FLASH_PAGE_SIZE		512	// largest chunk writable in s 'single' operation
+
 
 /* -------------------------------------------------------------------------- */
-/* Non-Volatile Memory Controller (NVMC) Registers */
+/* D1x, D2x Non-Volatile Memory Controller (NVMC) Registers */
 /* -------------------------------------------------------------------------- */
 
-#define SAMD_NVMC			0x41004000
-#define SAMD_NVMC_CTRLA			(SAMD_NVMC + 0x0)
-#define SAMD_NVMC_CTRLB			(SAMD_NVMC + 0x04)
-#define SAMD_NVMC_PARAM			(SAMD_NVMC + 0x08)
-#define SAMD_NVMC_INTFLAG		(SAMD_NVMC + 0x14)
-#define SAMD_NVMC_STATUS		(SAMD_NVMC + 0x18)
-#define SAMD_NVMC_ADDRESS		(SAMD_NVMC + 0x1C)
+#define SAMD_NVMC							0x41004000
+#define SAMD_NVMC_CTRLA					(SAMD_NVMC + 0x0)
+#define SAMD_NVMC_CTRLB					(SAMD_NVMC + 0x04)
+#define SAMD_NVMC_PARAM					(SAMD_NVMC + 0x08)
+
+#define SAMD_NVMC_INT_STATUS			(SAMD_NVMC + 0x14)
+
+#define SAMD_NVMC_STATUS				(SAMD_NVMC + 0x18)
+#define SAMD_NVMC_ADDRESS				(SAMD_NVMC + 0x1C)
 
 /* Control A Register (CTRLA) */
-#define SAMD_CTRLA_CMD_KEY		0xA500
+#define SAMD_CTRLA_CMD_KEY				0xA500
 #define SAMD_CTRLA_CMD_ERASEROW		0x0002
-#define SAMD_CTRLA_CMD_WRITEPAGE	0x0004
+#define SAMD_CTRLA_CMD_WRITEPAGE		0x0004
 #define SAMD_CTRLA_CMD_ERASEAUXROW	0x0005
 #define SAMD_CTRLA_CMD_WRITEAUXPAGE	0x0006
-#define SAMD_CTRLA_CMD_LOCK		0x0040
-#define SAMD_CTRLA_CMD_UNLOCK		0x0041
+#define SAMD_CTRLA_CMD_LOCK			0x0040
+#define SAMD_CTRLA_CMD_UNLOCK			0x0041
 #define SAMD_CTRLA_CMD_PAGEBUFFERCLEAR	0x0044
-#define SAMD_CTRLA_CMD_SSB		0x0045
-#define SAMD_CTRLA_CMD_INVALL		0x0046
+#define SAMD_CTRLA_CMD_SSB				0x0045
+#define SAMD_CTRLA_CMD_INVALL			0x0046
 
 /* Interrupt Flag Register (INTFLAG) */
 #define SAMD_NVMC_READY			(1 << 0)
 
+
+/* -------------------------------------------------------------------------- */
+/* D51 Non-Volatile Memory Controller (NVMC) Registers */
+/* -------------------------------------------------------------------------- */
+#define SAMD5_NVMC						0x41004000
+
+#define SAMD5_NVMC_CTRLA				(SAMD5_NVMC + 0x0)
+#define SAMD5_NVMC_CTRLB				(SAMD5_NVMC + 0x04)
+#define SAMD5_NVMC_PARAM				(SAMD5_NVMC + 0x08)
+#define SAMD5_NVMC_INT_STATUS			(SAMD5_NVMC + 0x10)		// 16bit
+#define SAMD5_NVMC_STATUS				(SAMD5_NVMC + 0x12)		// 16bit
+#define SAMD5_NVMC_ADDRESS				(SAMD5_NVMC + 0x14)
+
+#define SAMD5_NVMC_CTRLB_CMDEX_KEY	0xa500
+#define SAMD5_NVMC_CTRLB_CMD_UR		0x12
+#define SAMD5_NVMC_CTRLB_CMD_EB		0x01
+#define SAMD5_NVMC_CTRLB_CMD_WP		0x03
+
+#define SAMD5_NVMC_STATUS_READY		(1 << 0)
+
+
 /* Non-Volatile Memory Calibration and Auxiliary Registers */
 #define SAMD_NVM_USER_ROW_LOW		0x00804000
-#define SAMD_NVM_USER_ROW_HIGH		0x00804004
+#define SAMD_NVM_USER_ROW_HIGH	0x00804004
 #define SAMD_NVM_CALIBRATION		0x00806020
-#define SAMD_NVM_SERIAL(n)		(0x0080A00C + (0x30 * ((n + 3) / 4)) + \
-					 (0x4 * n))
+#define SAMD_NVM_SERIAL(n)			(0x0080A00C + (0x30 * ((n + 3) / 4)) + (0x4 * n))
+
+#define SAMD5_NVM_SERIAL(n)		(0x008061FC + (0x4 * n))
 
 /* -------------------------------------------------------------------------- */
 /* Device Service Unit (DSU) Registers */
 /* -------------------------------------------------------------------------- */
 
-#define SAMD_DSU			0x41002000
+#define SAMD_DSU						0x41002000	// D5x OK
 #define SAMD_DSU_EXT_ACCESS		(SAMD_DSU + 0x100)
-#define SAMD_DSU_CTRLSTAT		(SAMD_DSU_EXT_ACCESS + 0x0)
-#define SAMD_DSU_ADDRESS		(SAMD_DSU_EXT_ACCESS + 0x4)
-#define SAMD_DSU_LENGTH			(SAMD_DSU_EXT_ACCESS + 0x8)
-#define SAMD_DSU_DID			(SAMD_DSU_EXT_ACCESS + 0x018)
-#define SAMD_DSU_PID(n)			(SAMD_DSU + 0x1FE0 + \
-					 (0x4 * (n % 4)) - (0x10 * (n / 4)))
-#define SAMD_DSU_CID(n)			(SAMD_DSU + 0x1FF0 + \
-					 (0x4 * (n % 4)))
+#define SAMD_DSU_CTRLSTAT			(SAMD_DSU_EXT_ACCESS + 0x0)
+#define SAMD_DSU_ADDRESS			(SAMD_DSU_EXT_ACCESS + 0x4)
+#define SAMD_DSU_LENGTH				(SAMD_DSU_EXT_ACCESS + 0x8)
+#define SAMD_DSU_DID					(SAMD_DSU_EXT_ACCESS + 0x018)
+#define SAMD_DSU_PID(n)				(SAMD_DSU + 0x1FE0 + \
+												(0x4 * (n % 4)) - (0x10 * (n / 4)))
+#define SAMD_DSU_CID(n)				(SAMD_DSU + 0x1FF0 + \
+												(0x4 * (n % 4)))
 
-/* Control and Status Register (CTRLSTAT) */
+/* DSU Control and Status Register (CTRLSTAT)  D5x OK */
+#define SAMD_CTRL_SWRST				(1 << 0)
+#define SAMD_CTRL_CRC				(1 << 2)
+#define SAMD_CTRL_MBIST				(1 << 3)
 #define SAMD_CTRL_CHIP_ERASE		(1 << 4)
-#define SAMD_CTRL_MBIST			(1 << 3)
-#define SAMD_CTRL_CRC			(1 << 2)
-#define SAMD_STATUSA_PERR		(1 << 12)
-#define SAMD_STATUSA_FAIL		(1 << 11)
-#define SAMD_STATUSA_BERR		(1 << 10)
+#define SAMD_STATUSA_DONE			(1 << 8)
 #define SAMD_STATUSA_CRSTEXT		(1 << 9)
-#define SAMD_STATUSA_DONE		(1 << 8)
-#define SAMD_STATUSB_PROT		(1 << 16)
+#define SAMD_STATUSA_BERR			(1 << 10)
+#define SAMD_STATUSA_FAIL			(1 << 11)
+#define SAMD_STATUSA_PERR			(1 << 12)
+#define SAMD_STATUSB_PROT			(1 << 16)
 
-/* Device Identification Register (DID) */
-#define SAMD_DID_MASK			0xFFBC0000
+/* Device Identification Register (DID) D5x OK */
+#define SAMD_DID_MASK				0xFFBC0000
 #define SAMD_DID_CONST_VALUE		0x10000000
-#define SAMD_DID_DEVSEL_MASK		0x0F
+#define SAMD_DID_DEVSEL_MASK		0xFF
 #define SAMD_DID_DEVSEL_POS		0
-#define SAMD_DID_REVISION_MASK		0x0F
+#define SAMD_DID_REVISION_MASK	0x0F
 #define SAMD_DID_REVISION_POS		8
-#define SAMD_DID_SERIES_MASK		0x03
+#define SAMD_DID_SERIES_MASK		0x3F
 #define SAMD_DID_SERIES_POS		16
 
+#define SAMD_DID_FAMILY_MASK		0x1F
+#define SAMD_DID_FAMILY_POS		23
+
+#define SAMD_DID_PROCESSOR_MASK	0x0F
+#define SAMD_DID_PROCESSOR_POS	28
+
 /* Peripheral ID */
-#define SAMD_PID_MASK			0x00F7FFFF
+#define SAMD_PID_MASK				0x00F7FFFF
 #define SAMD_PID_CONST_VALUE		0x0001FCD0
 
 /* Component ID */
-#define SAMD_CID_VALUE			0xB105100D
+#define SAMD_CID_VALUE				0xB105100D
 
 /**
  * Reads the SAM D20 Peripheral ID
@@ -285,11 +339,14 @@ samd_protected_attach(target *t)
 	return true;
 }
 
+
 /**
  * Use the DSU Device Indentification Register to populate a struct
  * describing the SAM D device.
  */
 struct samd_descr {
+	uint8_t processor;
+	uint8_t family;
 	uint8_t series;
 	char revision;
 	char pin;
@@ -301,33 +358,49 @@ struct samd_descr samd_parse_device_id(uint32_t did)
 	struct samd_descr samd;
 	memset(samd.package, 0, 3);
 
-	uint8_t series = (did >> SAMD_DID_SERIES_POS)
-	  & SAMD_DID_SERIES_MASK;
-	uint8_t revision = (did >> SAMD_DID_REVISION_POS)
-	  & SAMD_DID_REVISION_MASK;
-	uint8_t devsel = (did >> SAMD_DID_DEVSEL_POS)
-	  & SAMD_DID_DEVSEL_MASK;
+	uint8_t series = (did >> SAMD_DID_SERIES_POS) & SAMD_DID_SERIES_MASK;
+	uint8_t revision = (did >> SAMD_DID_REVISION_POS) & SAMD_DID_REVISION_MASK;
+	uint8_t devsel = (did >> SAMD_DID_DEVSEL_POS) & SAMD_DID_DEVSEL_MASK;
 
+	samd.processor = (did >> SAMD_DID_PROCESSOR_POS) & SAMD_DID_PROCESSOR_MASK;
+	samd.family = (did >> SAMD_DID_FAMILY_POS) & SAMD_DID_FAMILY_MASK;
+	
 	/* Series */
 	switch (series) {
 		case 0: samd.series = 20; break;
 		case 1: samd.series = 21; break;
 		case 2: samd.series = 10; break;
 		case 3: samd.series = 11; break;
+		case 6: samd.series = 51; break;
 	}
 	/* Revision */
 	samd.revision = 'A' + revision;
 
 	switch (samd.series) {
 	case 20: /* SAM D20 */
-	case 21: /* SAM D21 */
-		switch (devsel / 5) {
-			case 0: samd.pin = 'J'; break;
-			case 1: samd.pin = 'G'; break;
-			case 2: samd.pin = 'E'; break;
-			default: samd.pin = 'u'; break;
+	case 21: /* SAM D21/R21 */
+		if (devsel < 0x18) {
+			switch (devsel / 5) {
+				case 0: samd.pin = 'J'; break;
+				case 1: samd.pin = 'G'; break;
+				case 2: samd.pin = 'E'; break;
+				default: samd.pin = 'u'; break;
+			}
+			samd.mem = 18 - (devsel % 5);
+		} else {
+			//samd.device = 'R';
+			samd.pin = 'R';
+			switch (devsel) {
+				default:
+				case 0x18: samd.mem = 19; break;
+				case 0x19: samd.mem = 18; break;
+				case 0x1a: samd.mem = 17; break;
+				case 0x1b: samd.mem = 16; break;
+				case 0x1c: samd.mem = 18; break;
+				case 0x1d: samd.mem = 17; break;
+				case 0x1e: samd.mem = 16; break;
+			}
 		}
-		samd.mem = 18 - (devsel % 5);
 		break;
 	case 10: /* SAM D10 */
 	case 11: /* SAM D11 */
@@ -338,8 +411,30 @@ struct samd_descr samd_parse_device_id(uint32_t did)
 		samd.pin = 'D';
 		samd.mem = 14 - (devsel % 3);
 		break;
-	}
+	case 51: /* SAMD51 */
+		switch (devsel) {
+			// SAMD51G18
+			// SAMD51G19
+			// SAMD51J18
 
+			// SAMD51J19
+			case 7:
+				samd.pin = 'J';
+				samd.mem = 19;
+			break;
+
+			// SAMD51J20
+			// SAMD51N19
+			
+			// SAMD51N20
+			case 2:						//
+				samd.pin = 'N';
+				samd.mem = 20;
+			break;
+		}
+		break;
+	}
+	
 	return samd;
 }
 
@@ -355,26 +450,50 @@ static void samd_add_flash(target *t, uint32_t addr, size_t length)
 	target_add_flash(t, f);
 }
 
+static void samd5_add_flash(target *t, uint32_t addr, size_t length)
+{
+	struct target_flash *f = calloc(1, sizeof(*f));
+	f->start = addr;
+	f->length = length;
+	f->blocksize = SAMD5_FLASH_BLOCK_SIZE;
+	f->erase = samd5_flash_erase;
+	f->write = samd5_flash_write;
+	f->buf_size = SAMD5_FLASH_PAGE_SIZE;
+	target_add_flash(t, f);
+}
+
+
 char variant_string[40];
 bool samd_probe(target *t)
 {
 	uint32_t cid = samd_read_cid(t);
 	uint32_t pid = samd_read_pid(t);
+	uint32_t did = target_mem_read32(t, SAMD_DSU_DID);
+	struct samd_descr samd = samd_parse_device_id(did);
+
+	t->driver = variant_string;
+	// d51N20:	0xb105100d 0x0009fcd0 0x060060002
+
+	sprintf(variant_string,"xxx 0x%08x 0x%08x 0x%08x",(int)cid,(int)pid,(int)did);
 
 	/* Check the ARM Coresight Component and Perhiperal IDs */
-	if ((cid != SAMD_CID_VALUE) ||
-	    ((pid & SAMD_PID_MASK) != SAMD_PID_CONST_VALUE))
+	if (
+			(cid != SAMD_CID_VALUE)
+		||	((pid & SAMD_PID_MASK) != SAMD_PID_CONST_VALUE)
+	) {
 		return false;
-
-	/* Read the Device ID */
-	uint32_t did = target_mem_read32(t, SAMD_DSU_DID);
-
-	/* If the Device ID matches */
-	if ((did & SAMD_DID_MASK) != SAMD_DID_CONST_VALUE)
+	}
+	
+	if (
+		!(
+				(samd.processor == 1)	// samd1x, samd2x
+			||	(samd.processor == 6)	// samd51
+		)
+	) {
 		return false;
-
+	}
+	
 	uint32_t ctrlstat = target_mem_read32(t, SAMD_DSU_CTRLSTAT);
-	struct samd_descr samd = samd_parse_device_id(did);
 
 	/* Protected? */
 	bool protected = (ctrlstat & SAMD_STATUSB_PROT);
@@ -387,9 +506,9 @@ bool samd_probe(target *t)
 		        samd.package, samd.revision);
 	} else {
 		sprintf(variant_string,
-		        "Atmel SAMD%d%c%dA%s (rev %c)",
+		        "Atmel SAMD%d%c%dA%s (rev %c) 0x%08x",
 		        samd.series, samd.pin, samd.mem,
-		        samd.package, samd.revision);
+		        samd.package, samd.revision,(int)did);
 	}
 
 	/* Setup Target */
@@ -416,20 +535,51 @@ bool samd_probe(target *t)
 		t->attach = samd_protected_attach;
 	}
 
-	target_add_ram(t, 0x20000000, 0x8000);
-	samd_add_flash(t, 0x00000000, 0x40000);
-	target_add_commands(t, samd_cmd_list, "SAMD");
+	#define KB(n)	((n) * 1024)
+
+	switch (samd.series) {
+		case 51:
+			switch (samd.mem) {
+				case 18:
+					target_add_ram(t, 0x20000000, KB(128));
+					samd5_add_flash(t, 0x00000000, KB(256));
+				break;
+				
+				case 19:
+					target_add_ram(t, 0x20000000, KB(192));
+					samd5_add_flash(t, 0x00000000, KB(512));
+				break;
+
+				case 20:
+					target_add_ram(t, 0x20000000, KB(256));
+					samd5_add_flash(t, 0x00000000, KB(1024));
+				break;
+				
+				default:
+					target_add_ram(t, 0x20000000, KB(32));
+					samd5_add_flash(t, 0x00000000, KB(256));
+				break;
+			}
+			target_add_commands(t, samd5_cmd_list, "SAMD5");
+		break;
+		
+		// D1x, D2x
+		default:
+			target_add_ram(t, 0x20000000, KB(32));
+			samd_add_flash(t, 0x00000000, KB(256));
+			target_add_commands(t, samd_cmd_list, "SAMD");
+		break;
+	}
+	
 
 	/* If we're not in reset here */
 	if (!platform_srst_get_val()) {
 		/* We'll have to release the target from
 		 * extended reset to make attach possible */
-		if (target_mem_read32(t, SAMD_DSU_CTRLSTAT) &
-		    SAMD_STATUSA_CRSTEXT) {
+		if (target_mem_read32(t, SAMD_DSU_CTRLSTAT) & SAMD_STATUSA_CRSTEXT) {
 
 			/* Write bit to clear from extended reset */
-			target_mem_write32(t, SAMD_DSU_CTRLSTAT,
-			                   SAMD_STATUSA_CRSTEXT);
+			target_mem_write32(t, SAMD_DSU_CTRLSTAT, SAMD_STATUSA_CRSTEXT);
 		}
 	}
 
@@ -441,7 +591,7 @@ bool samd_probe(target *t)
  */
 static void samd_lock_current_address(target *t)
 {
-	/* Issue the unlock command */
+	/* Issue the lock command */
 	target_mem_write32(t, SAMD_NVMC_CTRLA,
 	                   SAMD_CTRLA_CMD_KEY | SAMD_CTRLA_CMD_LOCK);
 }
@@ -470,7 +620,7 @@ static int samd_flash_erase(struct target_flash *f, target_addr addr, size_t len
 		target_mem_write32(t, SAMD_NVMC_CTRLA,
 		                   SAMD_CTRLA_CMD_KEY | SAMD_CTRLA_CMD_ERASEROW);
 		/* Poll for NVM Ready */
-		while ((target_mem_read32(t, SAMD_NVMC_INTFLAG) & SAMD_NVMC_READY) == 0)
+		while ((target_mem_read32(t, SAMD_NVMC_INT_STATUS) & SAMD_NVMC_READY) == 0)
 			if (target_check_error(t))
 				return -1;
 
@@ -492,6 +642,8 @@ static int samd_flash_write(struct target_flash *f,
 {
 	target *t = f->t;
 
+	// must be 16bit or 32bit writes
+
 	/* Write within a single page. This may be part or all of the page */
 	target_mem_write(t, dest, src, len);
 
@@ -503,12 +655,109 @@ static int samd_flash_write(struct target_flash *f,
 	                   SAMD_CTRLA_CMD_KEY | SAMD_CTRLA_CMD_WRITEPAGE);
 
 	/* Poll for NVM Ready */
-	while ((target_mem_read32(t, SAMD_NVMC_INTFLAG) & SAMD_NVMC_READY) == 0)
+	while ((target_mem_read32(t, SAMD_NVMC_INT_STATUS) & SAMD_NVMC_READY) == 0)
 		if (target_check_error(t))
 			return -1;
 
 	/* Lock */
 	samd_lock_current_address(t);
+
+	return 0;
+}
+
+/**
+ * Erase flash row by row
+ */
+static int samd5_flash_erase(struct target_flash *f, target_addr addr, size_t len)
+{
+	target *t = f->t;
+	
+	while (len) {
+		/* Write address of first word in row to erase it */
+		/* Must be shifted right for 16-bit address, see Datasheet §20.8.8 Address */
+		//target_mem_write32(t, SAMD_NVMC_ADDRESS, addr >> 1);
+
+		while((target_mem_read32(t, SAMD5_NVMC_STATUS) & SAMD5_NVMC_STATUS_READY) == 0);
+
+		/* Unlock */
+		//samd_unlock_current_address(t);
+		target_mem_write32 (t,SAMD5_NVMC_ADDRESS,addr);
+		target_mem_write32 (
+			t,
+			SAMD5_NVMC_CTRLB,
+			(
+					SAMD5_NVMC_CTRLB_CMDEX_KEY
+				|	SAMD5_NVMC_CTRLB_CMD_UR
+			)
+		);
+
+		/* Issue the erase command */
+		target_mem_write32 (t,SAMD5_NVMC_ADDRESS,addr);
+		target_mem_write32 (
+			t,
+			SAMD5_NVMC_CTRLB,
+			(
+					SAMD5_NVMC_CTRLB_CMDEX_KEY
+				|	SAMD5_NVMC_CTRLB_CMD_EB
+			)
+		);
+	
+		/* Poll for NVM Ready */
+		while((target_mem_read32(t, SAMD5_NVMC_STATUS) & SAMD5_NVMC_STATUS_READY) == 0) {
+			if (target_check_error(t))
+				return -1;
+		}
+
+		/* Lock */
+		//samd_lock_current_address(t);
+
+		addr += f->blocksize;
+		len -= f->blocksize;
+	}
+
+	return 0;
+}
+
+/**
+ * Write flash page by page
+ */
+static int samd5_flash_write (
+	struct target_flash *f,target_addr dest,const void *src, size_t len
+) {
+	target *t = f->t;
+	
+	
+	/* Unlock */
+	target_mem_write32 (t,SAMD5_NVMC_ADDRESS,dest);
+	target_mem_write32 (
+		t,
+		SAMD5_NVMC_CTRLB,
+		(
+				SAMD5_NVMC_CTRLB_CMDEX_KEY
+			|	SAMD5_NVMC_CTRLB_CMD_UR
+		)
+	);
+
+	// must be 32bit writes
+	
+	/* Write within a single page. This may be part or all of the page */
+	target_mem_write(t, dest, src, len);
+	
+	/* Issue the write page command */
+	target_mem_write32 (
+		t,
+		SAMD5_NVMC_CTRLB,
+		(
+				SAMD5_NVMC_CTRLB_CMDEX_KEY
+			|	SAMD5_NVMC_CTRLB_CMD_WP
+		)
+	);
+
+	/* Poll for NVM Ready */
+	while((target_mem_read32(t, SAMD5_NVMC_STATUS) & SAMD5_NVMC_STATUS_READY) == 0) {
+		if (target_check_error(t))
+			return -1;
+	}
 
 	return 0;
 }
@@ -545,7 +794,7 @@ static bool samd_cmd_erase_all(target *t)
 		return true;
 	}
 
-	tc_printf(t, "Erase successful!\n");
+	tc_printf(t, "samd erase successful!\n");
 
 	return true;
 }
@@ -571,7 +820,7 @@ static bool samd_set_flashlock(target *t, uint16_t value)
 	                   SAMD_CTRLA_CMD_KEY | SAMD_CTRLA_CMD_ERASEAUXROW);
 
 	/* Poll for NVM Ready */
-	while ((target_mem_read32(t, SAMD_NVMC_INTFLAG) & SAMD_NVMC_READY) == 0)
+	while ((target_mem_read32(t, SAMD_NVMC_INT_STATUS) & SAMD_NVMC_READY) == 0)
 		if (target_check_error(t))
 			return -1;
 
@@ -617,6 +866,34 @@ static bool samd_cmd_serial(target *t)
 
 	for (uint32_t i = 0; i < 4; i++) {
 		tc_printf(t, "%08x", target_mem_read32(t, SAMD_NVM_SERIAL(i)));
+	}
+
+	tc_printf(t, "\n");
+
+	return true;
+}
+
+static bool samd5_cmd_lock_flash(target *t)
+{
+	UNUSED(t);
+	return false;
+}
+
+static bool samd5_cmd_unlock_flash(target *t)
+{
+	UNUSED(t);
+	return false;
+}
+
+/**
+ * Reads the 128-bit serial number from the NVM
+ */
+static bool samd5_cmd_serial(target *t)
+{
+	tc_printf(t, "Serial Number: 0x");
+
+	for (uint32_t i = 0; i < 4; i++) {
+		tc_printf(t, "%08x", target_mem_read32(t, SAMD5_NVM_SERIAL(i)));
 	}
 
 	tc_printf(t, "\n");
@@ -687,7 +964,7 @@ static bool samd_cmd_ssb(target *t)
 	                   SAMD_CTRLA_CMD_KEY | SAMD_CTRLA_CMD_SSB);
 
 	/* Poll for NVM Ready */
-	while ((target_mem_read32(t, SAMD_NVMC_INTFLAG) & SAMD_NVMC_READY) == 0)
+	while ((target_mem_read32(t, SAMD_NVMC_INT_STATUS) & SAMD_NVMC_READY) == 0)
 		if (target_check_error(t))
 			return -1;
 
